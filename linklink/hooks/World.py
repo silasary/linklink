@@ -317,3 +317,11 @@ def after_collect_item(world: World, state: CollectionState, Changed: bool, item
 
 def after_remove_item(world: World, state: CollectionState, Changed: bool, item: Item):
     pass
+
+
+def before_generate_early(world: World, multiworld: MultiWorld, player: int) -> None:
+    """
+    This is the earliest hook called during generation, before anything else is done.
+    Use it to check or modify incompatible options, or to set up variables for later use.
+    """
+    pass

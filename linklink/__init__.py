@@ -1,15 +1,13 @@
-from base64 import b64encode
 import logging
 import os
-import json
-from typing import Callable, Optional, Counter
+from typing import Callable, Optional, ClassVar, Counter, Any
 import webbrowser
 
 import Utils
 from worlds.generic.Rules import forbid_items_for_player
 from worlds.LauncherComponents import Component, SuffixIdentifier, components, Type, launch_subprocess, icon_paths
 
-from .Data import item_table, location_table, region_table, category_table
+from .Data import item_table, location_table, category_table
 from .Game import game_name, filler_item_name, starting_items
 from .Meta import world_description, world_webworld, enable_region_diagram
 from .Locations import location_id_to_name, location_name_to_id, location_name_to_location, location_name_groups, victory_names
@@ -20,7 +18,8 @@ from .Regions import create_regions
 from .Items import ManualItem
 from .Rules import set_rules
 from .Options import manual_options_data
-from .Helpers import is_item_enabled, get_option_value, get_items_for_player, resolve_yaml_option, format_state_prog_items_key, ProgItemsCat
+from .Helpers import is_item_enabled, get_option_value, remove_specific_item, resolve_yaml_option, format_state_prog_items_key, ProgItemsCat
+from .container import APManualFile
 
 from BaseClasses import CollectionState, ItemClassification, Item
 from Options import PerGameCommonOptions
@@ -34,12 +33,12 @@ from .hooks.World import \
     before_generate_basic, after_generate_basic, \
     before_fill_slot_data, after_fill_slot_data, before_write_spoiler, \
     before_extend_hint_information, after_extend_hint_information, \
-    after_collect_item, after_remove_item
+    after_collect_item, after_remove_item, before_generate_early
 from .hooks.Data import hook_interpret_slot_data
 
 class ManualWorld(World):
     __doc__ = world_description
-    game: str = game_name
+    game: ClassVar[str] = game_name
     web = world_webworld
 
     options_dataclass = manual_options_data
@@ -74,7 +73,7 @@ class ManualWorld(World):
     def get_filler_item_name(self) -> str:
         return hook_get_filler_item_name(self, self.multiworld, self.player) or self.filler_item_name
 
-    def interpret_slot_data(self, slot_data: dict[str, any]):
+    def interpret_slot_data(self, slot_data: dict[str, Any]):
         #this is called by tools like UT
         if not slot_data:
             return False
@@ -92,6 +91,8 @@ class ManualWorld(World):
     def stage_assert_generate(cls, multiworld) -> None:
         runGenerationDataValidation(cls)
 
+    def generate_early(self) -> None:
+        before_generate_early(self, self.multiworld, self.player)
 
     def create_regions(self):
         before_create_regions(self, self.multiworld, self.player)
@@ -126,11 +127,15 @@ class ManualWorld(World):
             if item.get("trap"):
                 traps.append(name)
 
-            if "category" in item:
-                if not is_item_enabled(self.multiworld, self.player, item):
-                    item_count = 0
+            if not is_item_enabled(self.multiworld, self.player, item):
+                items_config[name] = 0
 
-            items_config[name] = item_count
+            else:
+                if item.get("classification_count"):
+                    items_config[name] = item["classification_count"]
+
+                else:
+                    items_config[name] = item_count
 
         items_config = before_create_items_all(items_config, self, self.multiworld, self.player)
 
@@ -150,10 +155,23 @@ class ManualWorld(World):
                         try:
                             if isinstance(cat, int):
                                 true_class = ItemClassification(cat)
-                            elif cat.startswith('0b'):
-                                true_class = ItemClassification(int(cat, base=0))
                             else:
-                                true_class = ItemClassification[cat]
+                                def stringCheck(string: str) ->  ItemClassification:
+                                    if string.isdigit():
+                                        true_class = ItemClassification(int(string))
+                                    elif string.startswith('0b'):
+                                        true_class = ItemClassification(int(string, base=0))
+                                    else:
+                                        true_class = ItemClassification[string]
+                                    return true_class
+
+                                if "+" in cat:
+                                    true_class = ItemClassification.filler
+                                    for substring in cat.split("+"):
+                                        true_class |= stringCheck(substring.strip())
+
+                                else:
+                                    true_class = stringCheck(cat)
                         except Exception as ex:
                             raise Exception(f"Item override '{cat}' for {name} improperly defined\n\n{type(ex).__name__}:{ex}")
 
@@ -228,7 +246,7 @@ class ManualWorld(World):
                 for starting_item in items:
                     items_started.append(starting_item)
                     self.multiworld.push_precollected(starting_item)
-                    pool.remove(starting_item)
+                    remove_specific_item(pool, starting_item)
 
         self.start_inventory = {i.name: items_started.count(i) for i in items_started}
 
@@ -240,7 +258,18 @@ class ManualWorld(World):
         # then will remove specific item placements below from the overall pool
         self.multiworld.itempool += pool
 
-        real_pool = pool + items_started
+        # Filter Precollected items for those not in logic aka created by start_inventory(_from_pool)
+        precollected_items = list(self.multiworld.precollected_items[self.player])
+
+        # UT doesn't precollect the exceptions so this can be skipped
+        if not hasattr(self.multiworld, "generation_is_fake"):
+            precollected_exceptions = self.options.start_inventory.value + self.options.start_inventory_from_pool.value # type: ignore
+            for item, count in precollected_exceptions.items():
+                items_iter = iter([i for i in precollected_items if i.name == item])
+                for _ in range(count):
+                    precollected_items.remove(next(items_iter))
+
+        real_pool = pool + precollected_items
         self.item_counts[self.player] = self.get_item_counts(pool=real_pool)
         self.item_counts_progression[self.player] = self.get_item_counts(pool=real_pool, only_progression=True)
 
@@ -362,7 +391,7 @@ class ManualWorld(World):
             location.place_locked_item(item_to_place)
 
             # remove the item we're about to place from the pool so it isn't placed twice
-            self.multiworld.itempool.remove(item_to_place)
+            remove_specific_item(self.multiworld.itempool, item_to_place)
 
 
         after_generate_basic(self, self.multiworld, self.player)
@@ -391,10 +420,12 @@ class ManualWorld(World):
         return slot_data
 
     def generate_output(self, output_directory: str):
-        data = self.client_data()
         filename = f"{self.multiworld.get_out_file_name_base(self.player)}.apmanual"
-        with open(os.path.join(output_directory, filename), 'wb') as f:
-            f.write(b64encode(bytes(json.dumps(data), 'utf-8')))
+        zf_path = os.path.join(output_directory, filename)
+
+        apmanual = APManualFile(zf_path, player=self.player, player_name=self.player_name)
+        apmanual.write()
+
 
     def write_spoiler(self, spoiler_handle):
         before_write_spoiler(self, self.multiworld, spoiler_handle)
@@ -422,7 +453,7 @@ class ManualWorld(World):
     One thing to remember is the more you loop the longer generation will take. So probably leave it as is unless you really needs it."""
 
     def add_filler_items(self, item_pool, traps):
-        Utils.deprecate("Use adjust_filler_items instead.")
+        Utils.deprecate("You're calling the deprecated add_filler_items() function. Use the adjust_filler_items() function instead.")
         return self.adjust_filler_items(item_pool, traps)
 
     def adjust_filler_items(self, item_pool, traps):
@@ -473,7 +504,7 @@ class ManualWorld(World):
                 else:
                     logging.warning("Could not remove enough non-progression items from the pool.")
                     break
-                item_pool.remove(popped)
+                remove_specific_item(item_pool, popped)
 
         return item_pool
 
@@ -500,18 +531,6 @@ class ManualWorld(World):
             return self.item_counts.get(player, Counter())
 
 
-    def client_data(self):
-        return {
-            "game": self.game,
-            'player_name': self.multiworld.get_player_name(self.player),
-            'player_id': self.player,
-            'items': self.item_name_to_item,
-            'locations': self.location_name_to_location,
-            # todo: extract connections out of multiworld.get_regions() instead, in case hooks have modified the regions.
-            'regions': region_table,
-            'categories': category_table
-        }
-
 ###
 # Non-world client methods
 ###
@@ -531,7 +550,7 @@ class VersionedComponent(Component):
         self.version = version
 
 def add_client_to_launcher() -> None:
-    version = 2025_08_12 # YYYYMMDD
+    version = 2025_11_30 # YYYYMMDD
     found = False
 
     if "manual" not in icon_paths:

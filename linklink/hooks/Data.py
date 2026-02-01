@@ -95,3 +95,7 @@ def hook_interpret_slot_data(world, player: int, slot_data: dict[str, Any]) -> b
 
 def after_load_option_file(option_table: dict) -> dict:
     return option_table
+
+
+def after_load_event_file(event_table: list) -> list:
+    return event_table
